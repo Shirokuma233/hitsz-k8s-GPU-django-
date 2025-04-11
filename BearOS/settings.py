@@ -42,6 +42,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'django.middleware.locale.LocaleMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -61,6 +62,10 @@ CORS_ALLOW_METHODS = [
 ]
 
 ROOT_URLCONF = 'BearOS.urls'
+# NFS存储根目录
+NFS_ROOT = '/nfs/users'
+# NFS共享存储根目录
+NFS_SHARE_ROOT = '/nfs/share'
 
 TEMPLATES = [
     {
