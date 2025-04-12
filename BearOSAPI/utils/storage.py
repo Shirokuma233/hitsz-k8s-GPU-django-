@@ -11,7 +11,28 @@ class NFSStorage:
 
     def __init__(self, username):
         self.base_path = os.path.join(settings.NFS_ROOT, username)
+        self.share_path = settings.NFS_SHARE_ROOT
         os.makedirs(self.base_path, exist_ok=True)
+        os.makedirs(self.share_path, exist_ok=True)
+
+    def list_share_files(self, relative_path):
+        """列出指定目录下的文件和文件夹"""
+        target_path = os.path.join(self.share_path, relative_path)
+        items = []
+
+        for item_name in os.listdir(target_path):
+            item_path = os.path.join(target_path, item_name)
+            stat = os.stat(item_path)
+
+            items.append({
+                'name': item_name,
+                'type': 'file' if os.path.isfile(item_path) else 'directory',
+                'modified': datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                'size': stat.st_size if os.path.isfile(item_path) else 0,
+                'path': os.path.join(relative_path, item_name)  # 关键：返回相对路径
+            })
+
+        return items
 
     def list_files(self, relative_path):
         """列出指定目录下的文件和文件夹"""

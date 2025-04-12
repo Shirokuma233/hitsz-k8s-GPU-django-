@@ -9,6 +9,39 @@ class UserPodAccess(models.Model):
         verbose_name='用户'
     )
     pod_name = models.CharField(max_length=255, verbose_name='Pod名称')
+    # 新添加的字段
+    status = models.CharField(
+        max_length=50,
+        verbose_name='状态',
+        null=True,
+        blank=True
+    )
+    start_time = models.DateTimeField(
+        verbose_name='启动时间',
+        null=True,
+        blank=True
+    )
+    calculate_resource = models.CharField(
+        max_length=255,
+        verbose_name='计算资源',
+        default='暂无GPU'
+    )
+    total_duration = models.IntegerField(
+        verbose_name='总时长(小时)',
+        null=True,
+        blank=True
+    )
+    runtime_duration = models.IntegerField(
+        verbose_name='已运行时长(小时)',
+        null=True,
+        blank=True
+    )
+    images = models.CharField(
+        max_length=255,
+        verbose_name='镜像环境',
+        null=True,
+        blank=True
+    )
     ssh_port = models.IntegerField(verbose_name='SSH端口')
     ssh_ip = models.CharField(max_length=255, verbose_name='SSHip')
     ssh_password = models.CharField(max_length=255, verbose_name='SSH密码')

@@ -62,6 +62,7 @@ CORS_ALLOW_METHODS = [
 ]
 
 ROOT_URLCONF = 'BearOS.urls'
+NFS_SERVER = '192.168.23.129'
 # NFS存储根目录
 NFS_ROOT = '/nfs/users'
 # NFS共享存储根目录

@@ -1,6 +1,6 @@
 from django.urls import path
 from .views import DashBoardAPIView, ContainerManagementCreateView, LoginResourceView, LoginValidView, file_list, \
-    file_upload, file_delete, file_download
+    file_upload, file_delete, file_download, file_share_list
 
 urlpatterns = [
     path('login/valid', LoginValidView.as_view(), name='LoginValidView'),
@@ -9,6 +9,7 @@ urlpatterns = [
     path('home/container-management/create', ContainerManagementCreateView.as_view(),
          name='ContainerManagementCreateView'),
 
+    path('home/file-share', file_share_list, name='file-share-list'),
     path('home/file-management/files/list', file_list, name='file-list'),
     path('home/file-management/files/upload', file_upload, name='file-upload'),
     path('home/file-management/files/delete', file_delete, name='file-delete'),

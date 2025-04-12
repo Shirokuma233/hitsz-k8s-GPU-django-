@@ -1,5 +1,6 @@
 import json
 import os
+from django.conf import settings
 import subprocess
 from datetime import datetime
 from .utils.storage import NFSStorage
@@ -91,10 +92,6 @@ class LoginResourceView(APIView):
     def post(self, request):
         data = json.loads(request.body)
         uid = data.get("username")
-        password = data.get("password")
-
-        print("data:", data)
-
         # 1. 检查 PV 是否存在
         pv_name = f"pv-user-{uid}"
         pv_exists = True
@@ -127,7 +124,7 @@ class LoginResourceView(APIView):
                         "storageClassName": f"storage-user-{uid}",
                         "nfs": {
                             "path": f"/nfs/users/{uid}",
-                            "server": "192.168.23.129"
+                            "server": f"{settings.NFS_SERVER}"
                         }
                     }
                 }
@@ -183,149 +180,12 @@ class LoginResourceView(APIView):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
 
-        # 5. 检查 FileBrowser 是否存在
-        deployment_name = f"filebrowser-user-{uid}"
-        fb_exists = True
-        try:
-            apps_v1.read_namespaced_deployment(
-                name=deployment_name,
-                namespace="container-management"
-            )
-        except client.ApiException as e:
-            if e.status == 404:
-                fb_exists = False
-            else:
-                return Response(
-                    {"error": f"检查FileBrowser时发生错误: {str(e)}"},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-
-        # 6. 如果 FileBrowser 不存在则创建
-        if not fb_exists:
-            try:
-                # 创建 FileBrowser Deployment
-                deployment_manifest = {
-                    "apiVersion": "apps/v1",
-                    "kind": "Deployment",
-                    "metadata": {
-                        "name": deployment_name,
-                        "labels": {"user": uid}},
-                    "spec": {
-                        "replicas": 1,
-                        "selector": {
-                            "matchLabels": {
-                                "app": "filebrowser",
-                                "user": uid
-                            }
-                        },
-                        "template": {
-                            "metadata": {
-                                "labels": {
-                                    "app": "filebrowser",
-                                    "user": uid
-                                }
-                            },
-                            "spec": {
-                                "containers": [{
-                                    "name": "filebrowser",
-                                    "image": "filebrowser/filebrowser",
-                                    "env": [
-                                        {
-                                            "name": "FB_USERNAME",
-                                            "value": f"{uid}"  # 设置默认用户名
-                                        },
-                                        {
-                                            "name": "FB_PASSWORD",
-                                            "value": f"{password}"  # 设置默认密码
-                                        }],
-                                    "volumeMounts": [{
-                                        "name": "user-storage",
-                                        "mountPath": "~/workspace"
-                                    }],
-                                    "resources": {
-                                        "limits": {
-                                            "cpu": "0.5",
-                                            "memory": "512Mi"
-                                        }
-                                    }
-                                }],
-                                "volumes": [{
-                                    "name": "user-storage",
-                                    "persistentVolumeClaim": {
-                                        "claimName": f"pvc-user-{uid}"
-                                    }
-                                }]
-                            }
-                        }
-                    }
-                }
-                apps_v1.create_namespaced_deployment(
-                    namespace="container-management",
-                    body=deployment_manifest
-                )
-            except client.ApiException as e:
-                return Response(
-                    {"error": f"创建filebrowser失败: {str(e)}"},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-
-        # 7. 检查 Service 是否存在
-        service_name = f"svc-filebrowser-user-{uid}"
-        service_exists = True
-        try:
-            v1.read_namespaced_service(
-                name=service_name,
-                namespace="container-management"
-            )
-        except client.ApiException as e:
-            if e.status == 404:
-                service_exists = False
-            else:
-                return Response(
-                    {"error": f"检查service时发生错误: {str(e)}"},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-        # 8. 如果 Service 不存在则创建
-        if not service_exists:
-            try:
-                service_manifest = {
-                    "apiVersion": "v1",
-                    "kind": "Service",
-                    "metadata": {
-                        "name": f"svc-filebrowser-user-{uid}",
-                        "labels": {"user": uid}
-                    },
-                    "spec": {
-                        "selector": {
-                            "app": "filebrowser",
-                            "user": uid
-                        },
-                        "ports": [{
-                            "protocol": "TCP",
-                            "port": 80,
-                            "targetPort": 80
-                        }],
-                        "type": "ClusterIP"
-                    }
-                }
-                v1.create_namespaced_service(
-                    namespace="container-management",
-                    body=service_manifest
-                )
-            except client.ApiClient as e:
-                return Response(
-                    {"error": f"创建service失败: {str(e)}"},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-
         # 返回成功响应
         return Response(
             {
                 "message": "资源检查/创建完成",
                 "pv_created": not pv_exists,
                 "pvc_created": not pvc_exists,
-                "filebrowser_created": not fb_exists,
-                "service_created": not service_exists,
             },
             status=status.HTTP_200_OK
         )
@@ -394,7 +254,7 @@ class DashBoardAPIView(APIView):
 
 class ContainerManagementCreateView(APIView):
 
-    def create_timed_pod(self, user, pod_name, password, image, activeDeadlineSeconds, cpu_limit="1",
+    def create_timed_pod(self, user, pod_name, password, image, activeDeadlineSeconds, gpu="暂无", cpu_limit="1",
                          memory_limit="1Gi"):
         # 加载Kubernetes配置
         config.load_kube_config()
@@ -501,7 +361,13 @@ class ContainerManagementCreateView(APIView):
                 defaults={
                     'ssh_port': ssh_port,
                     'ssh_ip': ssh_ip,
-                    'ssh_password': password
+                    'ssh_password': password,
+                    'status': "排队中",  # 新字段
+                    'start_time': datetime.now(),  # 新字段（确保是datetime对象）
+                    'calculate_resource': gpu,  # 新字段
+                    'total_duration': activeDeadlineSeconds // 3600,  # 新字段
+                    'runtime_duration': 0,  # 新字段
+                    'images': image  # 新字段
                 }
             )
 
@@ -519,9 +385,6 @@ class ContainerManagementCreateView(APIView):
         ret = v1.list_namespaced_pod(namespace=namespace, label_selector=label_selector)
         pods_info = []
         for pod in ret.items:
-            # 跳过非普通pod
-            if pod.metadata.owner_references:
-                continue
             start_time = pod.status.start_time
 
             # 如果Pod已经开始运行，则计算运行时长
@@ -542,34 +405,43 @@ class ContainerManagementCreateView(APIView):
             elif pod.status.phase == "Running":
                 display_status = "运行中"
 
-            # 我们还需要用户和pod_name从数据库获取登录信息
-            ssh_info = None  # 初始化
+            # 5. 及时更新内容存储到数据库
+            UserPodAccess.objects.update_or_create(
+                user__username=user,
+                pod_name=pod.metadata.name,
+                defaults={
+                    'status': display_status,  # 新字段
+                    'runtime_duration': runtime_hours,  # 新字段
+                }
+            )
+            # 更新完后从数据库中获取这些内容
+            db_info = None  # 初始化
             try:
-                ssh_info = UserPodAccess.objects.get(
+                db_info = UserPodAccess.objects.get(
                     user__username=user,
                     pod_name=pod.metadata.name
                 )
-                print(f"找到访问信息: {ssh_info.ssh_ip}:{ssh_info.ssh_port}")
+                print(f"找到访问信息: {db_info.ssh_ip}:{db_info.ssh_port}")
             except UserPodAccess.DoesNotExist:
                 print(f"用户 {user} 的 Pod {pod.metadata.name} 无访问记录")
             except Exception as e:
                 print(f"查询出错: {str(e)}")
 
             pod_info = {
-                "name": pod.metadata.name,
-                "status": display_status,
-                "startTime": start_time.strftime("%Y-%m-%d %H:%M:%S") if start_time else None,
-                "calculateResource": "暂无GPU",
-                "totalDuration": active_deadline_seconds // 3600,
-                "runtimeDuration": runtime_hours,  # 已运行时长（h）
-                "images": images,  # 镜像环境
+                "name": db_info.pod_name,
+                "status": db_info.status,
+                "startTime": db_info.start_time,
+                "calculateResource": db_info.calculate_resource,
+                "totalDuration": db_info.total_duration,
+                "runtimeDuration": db_info.runtime_duration,  # 已运行时长（h）
+                "images": db_info.images,  # 镜像环境
                 "operation": [
                     {
                         "action": "ssh",
                         "label": "SSH",
                         "tooltip": {
-                            "command": f'ssh -p {ssh_info.ssh_port} root@{ssh_info.ssh_ip}',
-                            "password": f'{ssh_info.ssh_password}'
+                            "command": f'ssh -p {db_info.ssh_port} root@{db_info.ssh_ip}',
+                            "password": f'{db_info.ssh_password}'
                         }
                     },
                     {
@@ -580,6 +452,10 @@ class ContainerManagementCreateView(APIView):
                             {"action": 'restart', "label": '重启容器'},
                             {"action": 'delete', "label": '删除容器'}
                         ]
+                    },
+                    {
+                        "action": "deleteFinished",
+                        "label": "删除",
                     }
                 ]
             }
@@ -616,6 +492,14 @@ class ContainerManagementCreateView(APIView):
 
 
 # file-management
+def file_share_list(request):
+    """获取文件列表"""
+    username = request.GET.get("username")
+    relativepath = request.GET.get("relativepath")
+    storage = NFSStorage(username)
+    files = storage.list_share_files(relativepath)
+    print(files)
+    return JsonResponse({'files': files})
 
 
 def file_list(request):
