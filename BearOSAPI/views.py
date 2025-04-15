@@ -491,6 +491,130 @@ class ContainerManagementCreateView(APIView):
         })
 
 
+class ContainerManagementDistributeView(APIView):
+
+    def create_mpi_job(
+            self,
+            user_name="bear",
+            job_name="test",
+            launcher_image="hello-world",  # 改为hello-world镜像
+            worker_image="hello-world",  # 改为hello-world镜像
+            args="",
+            worker_replicas=1,
+            slot_per_worker=1,
+            gpu="暂无",
+            cpu_limit="1",  # CPU限制替代GPU
+            cpu_request="1",  # CPU请求
+    ):
+        # 加载kubeconfig配置
+        config.load_kube_config()
+
+        np_num = worker_replicas * slot_per_worker
+        # 默认MPI命令参数
+        default_mpirun_args = [
+            "--allow-run-as-root",
+            "-np", f"{np_num}",
+            "-bind-to", "none",
+            "-map-by", "slot",
+            "-x", "PATH"
+        ]
+
+        args_list = args.split()  # 按空格拆分成列表，如 "--hostfile hosts.txt" → ["--hostfile", "hosts.txt"]
+        # 合并用户自定义参数
+        final_args = default_mpirun_args + (args_list if args_list else [])
+
+        # 构建MPIJob对象
+        mpi_job = {
+            "apiVersion": "kubeflow.org/v2beta1",
+            "kind": "MPIJob",
+            "metadata": {"name": job_name},
+            "spec": {
+                "slotsPerWorker": slot_per_worker,
+                "runPolicy": {"cleanPodPolicy": "Running"},
+                "mpiReplicaSpecs": {
+                    "Launcher": {
+                        "replicas": worker_replicas,
+                        "template": {
+                            "spec": {
+                                "containers": [{
+                                    "name": "launcher",
+                                    "image": launcher_image,
+                                    "command": ["mpirun"] + final_args,
+                                    "resources": {
+                                        "limits": {"cpu": cpu_limit},
+                                        "requests": {"cpu": cpu_request}
+                                    }
+                                }]
+                            }
+                        }
+                    },
+                    "Worker": {
+                        "replicas": worker_replicas,
+                        "template": {
+                            "spec": {
+                                "containers": [{
+                                    "name": "worker",
+                                    "image": worker_image,
+                                    "resources": {
+                                        "limits": {"cpu": cpu_limit},
+                                        "requests": {"cpu": cpu_request}
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        print(mpi_job)
+
+        # 创建MPIJob
+        try:
+            custom_api = client.CustomObjectsApi()
+            mpi_job = custom_api.create_namespaced_custom_object(
+                group="kubeflow.org",
+                version="v2beta1",
+                plural="mpijobs",
+                namespace="container-management",  # 指定namespace
+                body=mpi_job
+            )
+
+            db_user = User.objects.get(username=user_name)
+            # 5. 存储到数据库
+            UserPodAccess.objects.update_or_create(
+                user=db_user,
+                pod_name=job_name,
+                defaults={
+                    'ssh_port': 0,
+                    'ssh_ip': "",
+                    'ssh_password': "",
+                    'status': "排队中",  # 新字段
+                    'start_time': datetime.now(),  # 新字段（确保是datetime对象）
+                    'calculate_resource': gpu,  # 新字段
+                    'total_duration': 0,  # 新字段
+                    'runtime_duration': 0,  # 新字段
+                    'images': worker_image  # 新字段
+                }
+            )
+
+            return mpi_job
+
+        except client.ApiException as e:
+            print(f"创建mpi_job失败: {str(e)}")
+            raise
+
+    def post(self, request):
+        data = json.loads(request.body)
+        job = self.create_mpi_job(data.get('username'), data.get('pod_name'), data.get('imageEnvironment'),
+                                  data.get('imageEnvironment'), data.get('param'), data.get('workerReplicas'),
+                                  data.get('slotPerWorker'), data.get('gpuResource')
+                                  )
+        return JsonResponse({
+            "status": "success",
+        })
+
+
 # file-management
 def file_share_list(request):
     """获取文件列表"""
