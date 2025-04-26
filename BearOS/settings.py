@@ -61,12 +61,17 @@ CORS_ALLOW_METHODS = [
     'DELETE',
 ]
 
+MASTER = '172.25.95.4'
 ROOT_URLCONF = 'BearOS.urls'
-NFS_SERVER = '192.168.23.129'
+NFS_SERVER = '172.25.95.4'
 # NFS存储根目录
 NFS_ROOT = '/nfs/users'
 # NFS共享存储根目录
 NFS_SHARE_ROOT = '/nfs/share'
+# Docker Registry 配置
+DOCKER_REGISTRY_URL = 'http://localhost:5000'
+
+
 
 TEMPLATES = [
     {
@@ -124,7 +129,7 @@ TIME_ZONE = 'UTC'
 
 USE_I18N = True
 
-USE_TZ = True
+USE_TZ = False
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.1/howto/static-files/

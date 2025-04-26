@@ -12,6 +12,7 @@ from kubernetes import client, config
 from BearOSAPI.models import UserPodAccess
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate
+import requests
 
 # 加载 kube config（如果是集群外）
 config.load_kube_config()
@@ -118,7 +119,7 @@ class LoginResourceView(APIView):
                         "labels": {"user": uid}
                     },
                     "spec": {
-                        "capacity": {"storage": "1Gi"},
+                        "capacity": {"storage": "5Gi"},
                         "accessModes": ["ReadWriteMany"],
                         "persistentVolumeReclaimPolicy": "Retain",
                         "storageClassName": f"storage-user-{uid}",
@@ -163,7 +164,7 @@ class LoginResourceView(APIView):
                         "storageClassName": f"storage-user-{uid}",
                         "accessModes": ["ReadWriteMany"],
                         "resources": {
-                            "requests": {"storage": "1Gi"}
+                            "requests": {"storage": "5Gi"}
                         },
                         "selector": {
                             "matchLabels": {"user": uid}
@@ -205,12 +206,20 @@ class DashBoardAPIView(APIView):
             node_name = node.metadata.name
             cpu_capacity = node.status.capacity['cpu']
             memory_capacity = node.status.capacity['memory']
+            capacity = node.status.capacity
+            gpu_capacity = capacity.get('nvidia.com/gpu', 0)
+            
             cpu_allocatable = node.status.allocatable['cpu']
             memory_allocatable = node.status.allocatable['memory']
+            allocatable = node.status.allocatable
+            gpu_allocatable = allocatable.get('nvidia.com/gpu', 0)
             ready_condition = next((condition for condition in node.status.conditions if condition.type == "Ready"),
                                    None)
 
-            # 处理 GPU 资源，单位可能是毫核(milliCPU), but no GPU now
+            # 处理 GPU 资源
+            if gpu_capacity != 0:
+                total['gpu_capacity'] += int(gpu_capacity)
+                total['gpu_allocatable'] += int(gpu_allocatable)
 
             # 处理 CPU 资源，单位可能是毫核(milliCPU)
             total['cpu_capacity'] += int(cpu_capacity)
@@ -233,9 +242,9 @@ class DashBoardAPIView(APIView):
             node_info = {
                 "nodeId": idx + 1,
                 "nodeName": node_name,
-                "gpuType": "暂无",
-                "gpuCapacity": "暂无",
-                "gpuAllocatable": "暂无",
+                "gpuType": "无" if gpu_capacity == 0 else "T4",
+                "gpuCapacity": int(gpu_capacity),
+                "gpuAllocatable": int(cpu_allocatable),
                 "cpuCapacity": int(cpu_capacity),
                 "cpuAllocatable": int(cpu_allocatable),
                 "memoryCapacity": convert_to_GB(memory_capacity),  # 转换为GiB
@@ -251,10 +260,57 @@ class DashBoardAPIView(APIView):
         print(response_data)
         return JsonResponse(response_data)
 
+# 镜像仓库部分
+def calculate_size(manifest):
+    # 计算镜像层总大小（字节转MB/GB）
+    layers = manifest.get('layers', [])
+    total_size = sum(layer.get('size', 0) for layer in layers)
+    return f'{total_size // 1024 // 1024}MB' if total_size else ''
+
+def get_docker_images(request):
+    try:
+        # 1. 获取所有镜像名称
+        catalog_url = f'{settings.DOCKER_REGISTRY_URL}/v2/_catalog'
+        catalog_res = requests.get(catalog_url)
+        catalog_res.raise_for_status()
+        images = catalog_res.json().get('repositories', [])
+        print(images)
+
+        # 2. 获取每个镜像的标签信息
+        result = []
+        for image in images:
+            tags_url = f'{settings.DOCKER_REGISTRY_URL}/v2/{image}/tags/list'
+            tags_res = requests.get(tags_url)
+            tags_res.raise_for_status()
+            tags = tags_res.json().get('tags', [])
+
+            for tag in tags:
+                # 3. 获取镜像详情（可选）
+                manifest_url = f'{settings.DOCKER_REGISTRY_URL}/v2/{image}/manifests/{tag}'
+                manifest_res = requests.get(manifest_url)
+                manifest_res.raise_for_status()
+                size = calculate_size(manifest_res.json())  # 计算镜像大小
+
+                result.append({
+                    'title': image,
+                    'tag': f'tag:{tag}',
+                    'date': datetime.now().strftime('最近使用时间：%Y-%m-%d %H:%M:%S'),
+                    'note': 'Auto commit before container finishing',
+                    'size': size,
+                })
+
+        return JsonResponse({
+            "totalEnvs": result,
+        })
+
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
+
+
 
 class ContainerManagementCreateView(APIView):
 
-    def create_timed_pod(self, user, pod_name, password, image, activeDeadlineSeconds, gpu="暂无", cpu_limit="1",
+    def create_timed_pod(self, user, pod_name, password, image, gpu_resource="暂无", gpu_count=1, activeDeadlineSeconds=3600,cpu_limit="2",
                          memory_limit="1Gi"):
         # 加载Kubernetes配置
         config.load_kube_config()
@@ -279,15 +335,20 @@ class ContainerManagementCreateView(APIView):
                     "activeDeadlineSeconds": activeDeadlineSeconds,
                     "containers": [{
                         "name": "ssh-container",
-                        "image": "ubuntu:20.04",
-                        "command": ["/bin/sh", "-c", f"""
-                                        apt-get update && apt-get install -y openssh-server && \
-                                        echo 'root:{password}' | chpasswd && \
-                                        sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
-                                        mkdir /var/run/sshd && \
-                                        /usr/sbin/sshd -D
-                                    """],
+                        "image": "lnterface/ubuntu-ssh",
                         "ports": [{"containerPort": 22}],
+                        "resources": {  # 关键改动：添加 GPU 资源请求
+                            "limits": {
+                                # "nvidia.com/gpu" : 0,
+                                "cpu": cpu_limit,  
+                                "memory": memory_limit,  
+                            },
+                            "requests": {
+                                # "nvidia.com/gpu" : 0,
+                                "cpu": cpu_limit,  
+                                "memory": memory_limit,  
+                            }
+                        },
                         "volumeMounts": [  # volumeMounts 部分
                             {
                                 "name": "user-volume",
@@ -331,6 +392,7 @@ class ContainerManagementCreateView(APIView):
                         "user": user,
                         "app": f"ssh-{pod_name}",  # 必须与Service的selector匹配
                     },
+                    "externalTrafficPolicy": "Cluster",
                     "ports": [{
                         "protocol": "TCP",
                         "port": 22,
@@ -364,7 +426,7 @@ class ContainerManagementCreateView(APIView):
                     'ssh_password': password,
                     'status': "排队中",  # 新字段
                     'start_time': datetime.now(),  # 新字段（确保是datetime对象）
-                    'calculate_resource': gpu,  # 新字段
+                    'calculate_resource': f"{gpu_resource} * {gpu_count}卡",  # 新字段
                     'total_duration': activeDeadlineSeconds // 3600,  # 新字段
                     'runtime_duration': 0,  # 新字段
                     'images': image  # 新字段
@@ -483,8 +545,8 @@ class ContainerManagementCreateView(APIView):
     def post(self, request):
         data = json.loads(request.body)
         assigned_port, node_ip = self.create_timed_pod(data.get('username'), data.get('pod_name'), data.get('password'),
-                                                       data.get('imageEnvironment'),
-                                                       data.get('runtime') * 3600)
+                                                       data.get('imageEnvironment'),data.get('gpuResource'), data.get('gpuCount'),
+                                                       data.get('runtime') * 3600, )
         return JsonResponse({
             "status": "success",
             "ssh": f"ssh -p {assigned_port} root@{node_ip}"
@@ -494,17 +556,8 @@ class ContainerManagementCreateView(APIView):
 class ContainerManagementDistributeView(APIView):
 
     def create_mpi_job(
-            self,
-            user_name="bear",
-            job_name="test",
-            launcher_image="hello-world",  # 改为hello-world镜像
-            worker_image="hello-world",  # 改为hello-world镜像
-            args="",
-            worker_replicas=1,
-            slot_per_worker=1,
-            gpu="暂无",
-            cpu_limit="1",  # CPU限制替代GPU
-            cpu_request="1",  # CPU请求
+            self,user_name="bear",job_name="test",launcher_image="", 
+            args="",worker_replicas=1,slot_per_worker=1,gpu="",cpu_limit="8",  
     ):
         # 加载kubeconfig配置
         config.load_kube_config()
@@ -533,7 +586,7 @@ class ContainerManagementDistributeView(APIView):
                 "runPolicy": {"cleanPodPolicy": "Running"},
                 "mpiReplicaSpecs": {
                     "Launcher": {
-                        "replicas": worker_replicas,
+                        "replicas": 1,
                         "template": {
                             "spec": {
                                 "containers": [{
@@ -614,6 +667,97 @@ class ContainerManagementDistributeView(APIView):
             "status": "success",
         })
 
+# 保存、重启、删除容器相关
+# 保存image
+def save_pod_image(request):
+    data = json.loads(request.body)
+    pod_name = data.get('podName')
+    namespace = data.get('namespace')
+    
+    try:
+        # 1. 获取 Pod 所在节点信息
+        config.load_kube_config()
+        core_api = client.CoreV1Api()
+        pod = core_api.read_namespaced_pod(pod_name, namespace)
+        worker_node = pod.spec.node_name
+        
+        # 2. 在 Worker 节点执行 commit & push
+        registry_address = f"{settings.MASTER}:5000"  # 主节点镜像仓库地址
+        image_name = f"{registry_address}/{pod_name}:latest"
+        
+        # 通过 SSH 在 Worker 节点执行命令
+        ssh_cmd = f"""
+        pod_id=$(docker ps | grep {pod_name} | awk '{{print $1}}')
+        docker commit $pod_id {image_name}
+        docker push {image_name}
+        """
+        
+        result = subprocess.run(
+            f'ssh {worker_node} "{ssh_cmd}"',
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode == 0:
+            return JsonResponse({
+                "status": "success",
+                "image": image_name
+            })
+        else:
+            return JsonResponse({
+                "status": "error",
+                "message": result.stderr
+            }, status=500)
+
+    except Exception as e:
+        return JsonResponse({
+            "status": "error",
+            "message": str(e)
+        }, status=500)
+
+
+# 删除pod
+def delete_pod(request):
+    data = json.loads(request.body)
+    pod_name = data.get('podName')
+    namespace = data.get('namespace')
+    print(pod_name)
+    print(namespace)
+    
+    if not pod_name or not namespace:
+        return JsonResponse({
+            "status": "error",
+            "message": "podName and namespace are required"
+        }, status=400)
+
+    try:
+        # 删除 Pod
+        delete_options = client.V1DeleteOptions()
+        api_response = v1.delete_namespaced_pod(
+            name=pod_name,
+            namespace=namespace,
+            body=delete_options
+        )
+        
+        return JsonResponse({
+            "status": "success",
+            "message": f"Pod {pod_name} in namespace {namespace} is being deleted",
+            "details": str(api_response.status)
+        })
+
+    except client.rest.ApiException as api_e:
+        return JsonResponse({
+            "status": "error",
+            "message": f"K8s API error: {api_e.reason}",
+            "details": api_e.body
+        }, status=api_e.status)
+
+    except Exception as e:
+        return JsonResponse({
+            "status": "error",
+            "message": str(e)
+        }, status=500)
 
 # file-management
 def file_share_list(request):
