@@ -13,6 +13,7 @@ from BearOSAPI.models import UserPodAccess
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate
 import requests
+import re
 
 # 加载 kube config（如果是集群外）
 config.load_kube_config()
@@ -122,7 +123,7 @@ class LoginResourceView(APIView):
                         "capacity": {"storage": "5Gi"},
                         "accessModes": ["ReadWriteMany"],
                         "persistentVolumeReclaimPolicy": "Retain",
-                        "storageClassName": f"storage-user-{uid}",
+                        "storageClassName": "",
                         "nfs": {
                             "path": f"/nfs/users/{uid}",
                             "server": f"{settings.NFS_SERVER}"
@@ -161,7 +162,8 @@ class LoginResourceView(APIView):
                         "labels": {"user": uid}
                     },
                     "spec": {
-                        "storageClassName": f"storage-user-{uid}",
+                        "storageClassName": "",
+                        "volumeName": pv_name,
                         "accessModes": ["ReadWriteMany"],
                         "resources": {
                             "requests": {"storage": "5Gi"}
@@ -180,7 +182,94 @@ class LoginResourceView(APIView):
                     {"error": f"创建存储资源pvc失败: {str(e)}"},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
+        # 1. 检查 第二个PV 是否存在
+        pv_name = f"pv-user-{uid}-mpi"
+        pv_exists = True
+        try:
+            v1.read_persistent_volume(pv_name)
+        except client.ApiException as e:
+            if e.status == 404:
+                pv_exists = False
+            else:
+                return Response(
+                    {"error": f"检查PV时发生错误: {str(e)}"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
 
+        # 2. 如果 PV 不存在则创建
+        if not pv_exists and self.create_nfs_directory(uid):
+            try:
+                # 创建 PV
+                pv_manifest = {
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolume",
+                    "metadata": {
+                        "name": pv_name,
+                        "labels": {"user": uid}
+                    },
+                    "spec": {
+                        "capacity": {"storage": "5Gi"},
+                        "accessModes": ["ReadWriteMany"],
+                        "persistentVolumeReclaimPolicy": "Retain",
+                        "storageClassName": "",
+                        "nfs": {
+                            "path": f"/nfs/users/{uid}",
+                            "server": f"{settings.NFS_SERVER}"
+                        }
+                    }
+                }
+                v1.create_persistent_volume(body=pv_manifest)
+            except client.ApiException as e:
+                return Response(
+                    {"error": f"创建存储资源pv失败: {str(e)}"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+                
+        # 3. 检查 第二个命名空间的PVC 是否存在
+        pvc_name = f"pvc-user-{uid}"
+        pvc_exists = True
+        try:
+            v1.read_namespaced_persistent_volume_claim(pvc_name, "container-management-mpi")
+        except client.ApiException as e:
+            if e.status == 404:
+                pvc_exists = False
+            else:
+                return Response(
+                    {"error": f"检查PVC时发生错误: {str(e)}"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+
+        # 4. 如果 PVC 不存在则创建
+        if not pvc_exists:
+            try:
+                pvc_manifest = {
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaim",
+                    "metadata": {
+                        "name": pvc_name,
+                        "labels": {"user": uid}
+                    },
+                    "spec": {
+                        "storageClassName": "",
+                        "volumeName": pv_name,
+                        "accessModes": ["ReadWriteMany"],
+                        "resources": {
+                            "requests": {"storage": "5Gi"}
+                        },
+                        "selector": {
+                            "matchLabels": {"user": uid}
+                        }
+                    }
+                }
+                v1.create_namespaced_persistent_volume_claim(
+                    namespace="container-management-mpi",
+                    body=pvc_manifest
+                )
+            except client.ApiException as e:
+                return Response(
+                    {"error": f"创建存储资源pvc失败: {str(e)}"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
         # 返回成功响应
         return Response(
             {
@@ -244,7 +333,7 @@ class DashBoardAPIView(APIView):
                 "nodeName": node_name,
                 "gpuType": "无" if gpu_capacity == 0 else "T4",
                 "gpuCapacity": int(gpu_capacity),
-                "gpuAllocatable": int(cpu_allocatable),
+                "gpuAllocatable": int(gpu_allocatable),
                 "cpuCapacity": int(cpu_capacity),
                 "cpuAllocatable": int(cpu_allocatable),
                 "memoryCapacity": convert_to_GB(memory_capacity),  # 转换为GiB
@@ -292,12 +381,14 @@ def get_docker_images(request):
                 size = calculate_size(manifest_res.json())  # 计算镜像大小
 
                 result.append({
-                    'title': image,
-                    'tag': f'tag:{tag}',
+                    'title':image,
+                    'tag':tag,
                     'date': datetime.now().strftime('最近使用时间：%Y-%m-%d %H:%M:%S'),
                     'note': 'Auto commit before container finishing',
                     'size': size,
+                    'full': f"{image}:{tag}",
                 })
+                print(image+tag)
 
         return JsonResponse({
             "totalEnvs": result,
@@ -310,8 +401,8 @@ def get_docker_images(request):
 
 class ContainerManagementCreateView(APIView):
 
-    def create_timed_pod(self, user, pod_name, password, image, gpu_resource="暂无", gpu_count=1, activeDeadlineSeconds=3600,cpu_limit="2",
-                         memory_limit="1Gi"):
+    def create_timed_pod(self, user, pod_name, password, image, gpu_resource="暂无", gpu_count=1, activeDeadlineSeconds=3600,cpu_limit="8",
+                         memory_limit="16Gi"):
         # 加载Kubernetes配置
         config.load_kube_config()
 
@@ -335,19 +426,23 @@ class ContainerManagementCreateView(APIView):
                     "activeDeadlineSeconds": activeDeadlineSeconds,
                     "containers": [{
                         "name": "ssh-container",
-                        "image": "lnterface/ubuntu-ssh",
+                        "image": image,
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["/bin/bash", "-c", f"""
+                            echo 'export $(cat /proc/1/environ | tr \'\\0\' \'\\n\' | xargs)' >> /etc/profile && \
+                            apt-get update && apt-get install -y openssh-server && \
+                            echo 'root:{password}' | chpasswd && \
+                            sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+                            mkdir -p /var/run/sshd && \
+                            /usr/sbin/sshd -D
+                        """],
                         "ports": [{"containerPort": 22}],
                         "resources": {  # 关键改动：添加 GPU 资源请求
                             "limits": {
-                                # "nvidia.com/gpu" : 0,
+                                "nvidia.com/gpu": gpu_count,
                                 "cpu": cpu_limit,  
                                 "memory": memory_limit,  
                             },
-                            "requests": {
-                                # "nvidia.com/gpu" : 0,
-                                "cpu": cpu_limit,  
-                                "memory": memory_limit,  
-                            }
                         },
                         "volumeMounts": [  # volumeMounts 部分
                             {
@@ -458,7 +553,10 @@ class ContainerManagementCreateView(APIView):
                 runtime_hours = 0
 
             # 获取镜像环境
-            images = str([container.image for container in pod.spec.containers] if pod.spec.containers else [])
+            images = [
+                container.image.replace("172.25.95.4:5000/", "")
+                for container in pod.spec.containers
+            ] if pod.spec.containers else []
 
             active_deadline_seconds = int(pod.spec.active_deadline_seconds) if pod.spec.active_deadline_seconds else 0
             display_status = "排队中"
@@ -474,6 +572,7 @@ class ContainerManagementCreateView(APIView):
                 defaults={
                     'status': display_status,  # 新字段
                     'runtime_duration': runtime_hours,  # 新字段
+                    'images': images,
                 }
             )
             # 更新完后从数据库中获取这些内容
@@ -511,7 +610,6 @@ class ContainerManagementCreateView(APIView):
                         "label": "更多操作",
                         "menuItems": [
                             {"action": 'save', "label": '保存容器'},
-                            {"action": 'restart', "label": '重启容器'},
                             {"action": 'delete', "label": '删除容器'}
                         ]
                     },
@@ -519,6 +617,78 @@ class ContainerManagementCreateView(APIView):
                         "action": "deleteFinished",
                         "label": "删除",
                     }
+                ]
+            }
+            pods_info.append(pod_info)
+        
+        # 对于mpi任务
+        namespace= "container-management-mpi"
+        label_selector = f"user={user}"
+        ret = v1.list_namespaced_pod(namespace=namespace, label_selector=label_selector)
+        for pod in ret.items:
+            start_time = pod.status.start_time
+
+            # 如果Pod已经开始运行，则计算运行时长
+            if start_time:
+                current_time = datetime.now(start_time.tzinfo)  # 确保使用相同的时区
+                runtime_seconds = (current_time - start_time).total_seconds()  # 计算已运行时长（秒）
+                runtime_hours = runtime_seconds // 3600
+            else:
+                runtime_hours = 0
+
+            # 获取镜像环境
+
+            images = [
+                container.image.replace("172.25.95.4:5000/", "")
+                for container in pod.spec.containers
+            ] if pod.spec.containers else []
+
+            active_deadline_seconds = int(pod.spec.active_deadline_seconds) if pod.spec.active_deadline_seconds else 0
+            display_status = "排队中"
+            if pod.status.phase == "Succeeded" or pod.status.phase == "Failed":
+                display_status = "已完成"
+            elif pod.status.phase == "Running":
+                display_status = "运行中"
+
+            # 5. 及时更新内容存储到数据库
+            UserPodAccess.objects.update_or_create(
+                user__username=user,
+                pod_name=pod.metadata.labels.get("pod_name"),
+                defaults={
+                    'status': display_status,  # 新字段
+                    'runtime_duration': runtime_hours,  # 新字段
+                    'images': images,
+                }
+            )
+            # 更新完后从数据库中获取这些内容
+            db_info = None  # 初始化
+            try:
+                db_info = UserPodAccess.objects.get(
+                    user__username=user,
+                    pod_name=pod.metadata.labels.get("pod_name")
+                )
+                
+            except UserPodAccess.DoesNotExist:
+                print(f"用户 {user} 的 Pod {pod.metadata.labels.get('pod_name') } 无访问记录")
+            except Exception as e:
+                print(f"查询出错: {str(e)}")
+
+            pod_info = {
+                "name": db_info.pod_name,
+                "status": db_info.status,
+                "startTime": db_info.start_time,
+                "calculateResource": db_info.calculate_resource,
+                "totalDuration": db_info.total_duration,
+                "runtimeDuration": db_info.runtime_duration,  # 已运行时长（h）
+                "images": db_info.images,  # 镜像环境
+                "operation": [
+                    {
+                        "action": "ssh",
+                        "label": "日志保存在/workspace/MPIlogs目录下",
+                        "tooltip": {
+                            "提示":"日志保存在/workspace/MPIlogs目录下" 
+                        }
+                    },
                 ]
             }
             pods_info.append(pod_info)
@@ -554,50 +724,76 @@ class ContainerManagementCreateView(APIView):
 
 
 class ContainerManagementDistributeView(APIView):
-
     def create_mpi_job(
-            self,user_name="bear",job_name="test",launcher_image="", 
-            args="",worker_replicas=1,slot_per_worker=1,gpu="",cpu_limit="8",  
+            self,user_name="bear",job_name="test",launcher_image="", worker_image="", 
+            args="",worker_replicas=1,slot_per_worker=1,gpu="",cpu_limit="8",memory_limit="16Gi"  
     ):
+        print(slot_per_worker)
+        
         # 加载kubeconfig配置
         config.load_kube_config()
 
         np_num = worker_replicas * slot_per_worker
         # 默认MPI命令参数
-        default_mpirun_args = [
-            "--allow-run-as-root",
-            "-np", f"{np_num}",
-            "-bind-to", "none",
-            "-map-by", "slot",
-            "-x", "PATH"
-        ]
-
-        args_list = args.split()  # 按空格拆分成列表，如 "--hostfile hosts.txt" → ["--hostfile", "hosts.txt"]
-        # 合并用户自定义参数
-        final_args = default_mpirun_args + (args_list if args_list else [])
-
+        # default_mpirun_args = [
+        #     "--allow-run-as-root",
+        #     "-np", f"{np_num}",
+        #     "-bind-to", "none",
+        #     "-map-by", "slot",
+        #     "-x", "PATH"
+        # ]
+        
         # 构建MPIJob对象
-        mpi_job = {
+        mpi_job_body = {
             "apiVersion": "kubeflow.org/v2beta1",
             "kind": "MPIJob",
-            "metadata": {"name": job_name},
+            "metadata": {"name": f"mpijob-{job_name}"},
             "spec": {
                 "slotsPerWorker": slot_per_worker,
-                "runPolicy": {"cleanPodPolicy": "Running"},
+                "runPolicy": {"cleanPodPolicy": "Running", 
+                              "ttlSecondsAfterFinished": 10,
+                              # "backoffLimit": 0, 
+                              },
                 "mpiReplicaSpecs": {
                     "Launcher": {
                         "replicas": 1,
                         "template": {
+                            "metadata": {
+                                "labels": {"user": user_name, "pod_name": f"mpijob-{job_name}"},
+                            },
                             "spec": {
                                 "containers": [{
                                     "name": "launcher",
                                     "image": launcher_image,
-                                    "command": ["mpirun"] + final_args,
-                                    "resources": {
-                                        "limits": {"cpu": cpu_limit},
-                                        "requests": {"cpu": cpu_request}
+                                    "imagePullPolicy": "IfNotPresent",
+                                    "command": ["/bin/bash", "-c", f"""
+                                            # 创建日志目录
+                                            mkdir -p /workspace/MPIlogs
+                                            # 将后续所有输出重定向到日志文件
+                                            exec > >(tee /workspace/MPIlogs/mpijob-{job_name}.log) 2>&1
+                                            # 导出环境变量
+                                            idx=0
+                                            while read -r host slots; do
+                                                export "WORKER_$idx=$host"
+                                                idx=$((idx+1))
+                                            done < /etc/mpi/hostfile
+                                            /usr/sbin/sshd -De & sleep 10 && {args}
+                                        """ ],
+                                    "volumeMounts": [  # volumeMounts 部分
+                                        {
+                                            "name": "user-volume",
+                                            "mountPath": "/workspace"  # 容器内的挂载路径
+                                        }
+                                    ]
+                                }],
+                                "volumes": [  # volumes 部分
+                                    {
+                                        "name": "user-volume",
+                                        "persistentVolumeClaim": {
+                                            "claimName": f"pvc-user-{user_name}"
+                                        }
                                     }
-                                }]
+                                ],
                             }
                         }
                     },
@@ -608,11 +804,29 @@ class ContainerManagementDistributeView(APIView):
                                 "containers": [{
                                     "name": "worker",
                                     "image": worker_image,
+                                    "imagePullPolicy": "IfNotPresent",
                                     "resources": {
-                                        "limits": {"cpu": cpu_limit},
-                                        "requests": {"cpu": cpu_request}
+                                        "limits": {
+                                            "cpu": cpu_limit, 
+                                            "memory": memory_limit,
+                                            "nvidia.com/gpu": slot_per_worker
+                                            },
+                                    },
+                                    "volumeMounts": [  # volumeMounts 部分
+                                        {
+                                            "name": "user-volume",
+                                            "mountPath": "/workspace"  # 容器内的挂载路径
+                                        }
+                                    ]
+                                }],
+                                "volumes": [  # volumes 部分
+                                    {
+                                        "name": "user-volume",
+                                        "persistentVolumeClaim": {
+                                            "claimName": f"pvc-user-{user_name}"
+                                        }
                                     }
-                                }]
+                                ],
                             }
                         }
                     }
@@ -620,7 +834,7 @@ class ContainerManagementDistributeView(APIView):
             }
         }
 
-        print(mpi_job)
+        print(mpi_job_body)
 
         # 创建MPIJob
         try:
@@ -629,19 +843,19 @@ class ContainerManagementDistributeView(APIView):
                 group="kubeflow.org",
                 version="v2beta1",
                 plural="mpijobs",
-                namespace="container-management",  # 指定namespace
-                body=mpi_job
+                namespace="container-management-mpi",  # 指定namespace
+                body=mpi_job_body
             )
-
+        
             db_user = User.objects.get(username=user_name)
             # 5. 存储到数据库
             UserPodAccess.objects.update_or_create(
                 user=db_user,
-                pod_name=job_name,
+                pod_name=f"mpijob-{job_name}",
                 defaults={
-                    'ssh_port': 0,
-                    'ssh_ip': "",
-                    'ssh_password': "",
+                    'ssh_port': 1111,
+                    'ssh_ip': "1111",
+                    'ssh_password': "1111",
                     'status': "排队中",  # 新字段
                     'start_time': datetime.now(),  # 新字段（确保是datetime对象）
                     'calculate_resource': gpu,  # 新字段
@@ -650,7 +864,8 @@ class ContainerManagementDistributeView(APIView):
                     'images': worker_image  # 新字段
                 }
             )
-
+            
+            print(mpi_job)
             return mpi_job
 
         except client.ApiException as e:
@@ -660,8 +875,8 @@ class ContainerManagementDistributeView(APIView):
     def post(self, request):
         data = json.loads(request.body)
         job = self.create_mpi_job(data.get('username'), data.get('pod_name'), data.get('imageEnvironment'),
-                                  data.get('imageEnvironment'), data.get('param'), data.get('workerReplicas'),
-                                  data.get('slotPerWorker'), data.get('gpuResource')
+                                  data.get('imageEnvironment'), data.get('param'), int(data.get('workerReplicas')),
+                                  int(data.get('slotPerWorker')), data.get('gpuResource')
                                   )
         return JsonResponse({
             "status": "success",
@@ -674,22 +889,45 @@ def save_pod_image(request):
     pod_name = data.get('podName')
     namespace = data.get('namespace')
     
+    def get_new_image_name(image_name: str) -> str:
+        # 正则匹配结尾的 -v 数字部分
+        pattern = r'(.*)-v(\d+)$'
+        match = re.match(pattern, image_name)
+
+        if not match:
+            # 没有找到 -v 数字结尾，直接加 -v1
+            return f"{image_name}-v1"
+        else:
+            prefix, version_str = match.groups()
+            version_num = int(version_str)
+            new_version = version_num + 1
+            return f"{prefix}-v{new_version}"
     try:
         # 1. 获取 Pod 所在节点信息
         config.load_kube_config()
         core_api = client.CoreV1Api()
         pod = core_api.read_namespaced_pod(pod_name, namespace)
         worker_node = pod.spec.node_name
+        # 获取原始镜像名
+        original_image = pod.spec.containers[0].image  # 获取容器使用的镜像名
+
+        # 获取新版本镜像名
+        new_image_name = get_new_image_name(original_image)
+
+        print("Original image:", original_image)
+        print("New image name:", new_image_name)
         
+        #获取容器名
+        container_id = pod.status.container_statuses[0].container_id
+        container_id = container_id.replace('docker://', '')
         # 2. 在 Worker 节点执行 commit & push
         registry_address = f"{settings.MASTER}:5000"  # 主节点镜像仓库地址
-        image_name = f"{registry_address}/{pod_name}:latest"
-        
-        # 通过 SSH 在 Worker 节点执行命令
         ssh_cmd = f"""
-        pod_id=$(docker ps | grep {pod_name} | awk '{{print $1}}')
-        docker commit $pod_id {image_name}
-        docker push {image_name}
+        # 提交新的镜像
+        docker commit {container_id} {new_image_name}
+
+        # 推送镜像到私有仓库
+        docker push {new_image_name}
         """
         
         result = subprocess.run(
